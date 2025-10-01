@@ -1,5 +1,5 @@
 //
-// AliSniffer.m  (wider capture: AVURLAsset + AVPlayer path; stream-first; kniunet whitelist; safe banner)
+// AliSniffer.m  (focus live; wide hooks: Session/AV/AVURLAsset/AVPlayer/WK + generic URL setters)
 // iOS 11+ / arm64 / -fobjc-arc
 //
 
@@ -20,7 +20,7 @@ static UIViewController *AS_TopVC(void) {
                     if (sc.activationState != UISceneActivationStateForegroundActive) continue;
                     if (![sc isKindOfClass:UIWindowScene.class]) continue;
                     for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                        if (w.isHidden) continue;
+                        if (w.hidden) continue;
                         UIViewController *vc = w.rootViewController;
                         while (vc.presentedViewController) vc = vc.presentedViewController;
                         if (vc) { top = vc; return; }
@@ -61,7 +61,9 @@ static void AS_AlertCopy(NSString *url) {
             UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"抓到完整请求"
                                                                         message:[@"\n" stringByAppendingString:url]
                                                                  preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){ UIPasteboard.generalPasteboard.string = url; }]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"复制" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a){
+                UIPasteboard.generalPasteboard.string = url;
+            }]];
             [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
             UIViewController *vc = AS_TopVC();
             if (vc) [vc presentViewController:ac animated:YES completion:nil];
@@ -82,18 +84,32 @@ static BOOL AS_isBlack(NSString *s) {
     NSString *lower = s.lowercaseString;
     NSURL *u = [NSURL URLWithString:s];
     NSString *host = u.host.lowercaseString ?: @"";
+    NSString *path = u.path.lowercaseString ?: @"";
+
+    // 1) 阿里日志上报
     if ([host hasSuffix:@"log.aliyuncs.com"]) return YES;
     if ([lower containsString:@"/logstores/"]) return YES;
+
+    // 2) kuniunet 的非流业务接口
+    // liveContentList / playNumCount
     if ([host containsString:@"app.kuniunet.com"] &&
-        [lower containsString:@"/mag/livevideo/"] &&
-        [lower containsString:@"videodetail"]) return YES;
+        [path containsString:@"/mag/"] &&
+        ([lower containsString:@"livecontentlist"] || [lower containsString:@"playnumcount"])) {
+        return YES;
+    }
+    // lychat 全部静音
+    if ([host containsString:@"app.kuniunet.com"] &&
+        [path containsString:@"/lychat/"]) {
+        return YES;
+    }
     return NO;
 }
 
 static BOOL AS_hasAuthKey(NSString *s) {
     if (!s) return NO;
     NSString *l = s.lowercaseString;
-    return [l containsString:@"auth_key="] || [l containsString:@"auth_key%3d"] || [l containsString:@"auth_key%3D"] || [l containsString:@"authkey="] || [l containsString:@"token="];
+    return [l containsString:@"auth_key="] || [l containsString:@"auth_key%3d"] || [l containsString:@"auth_key%3D"]
+        || [l containsString:@"authkey="] || [l containsString:@"token="];
 }
 
 static BOOL AS_likeStream(NSString *s) {
@@ -106,17 +122,19 @@ static BOOL AS_likeStream(NSString *s) {
     return [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)] != nil;
 }
 
-#pragma mark - Report (stream first; obey black/white)
+#pragma mark - Report
 
 static void AS_Report(NSString *url) {
     if (url.length==0) return;
     if (AS_isBlack(url)) return;
-    // 白名单域名优先
+    // 白名单域名优先；否则需命中 auth_key 或流特征
     if (!(AS_isKuniNet(url) || AS_hasAuthKey(url) || AS_likeStream(url))) return;
 
     NSLog(@"[AS] stream candidate: %@", url);
     @try {
-        [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFoundURL" object:nil userInfo:@{@"url":url}];
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFoundURL"
+                                                            object:nil
+                                                          userInfo:@{@"url":url}];
     } @catch (...) {}
     AS_AlertCopy(url);
 }
@@ -191,9 +209,8 @@ static void Install_Session(void) {
     } @catch(...) { NSLog(@"[AS] NSURLSession hooks failed."); }
 }
 
-#pragma mark - AVPlayer / AVURLAsset path
+#pragma mark - AV path (AVPlayerItem/AVURLAsset/AVPlayer)
 
-// 观察 AVPlayerItem 的 access log（保留）
 static void ObserveItem(AVPlayerItem *item) {
     if (!item) return;
     @try {
@@ -214,7 +231,6 @@ static void ObserveItem(AVPlayerItem *item) {
     } @catch (...) {}
 }
 
-// AVPlayerItem initWithURL: （原有）
 static id (*o_Item_initWithURL)(id,SEL,NSURL*);
 static id sw_Item_initWithURL(id self, SEL _cmd, NSURL *URL) {
     id item = o_Item_initWithURL? o_Item_initWithURL(self,_cmd,URL):nil;
@@ -225,7 +241,6 @@ static id sw_Item_initWithURL(id self, SEL _cmd, NSURL *URL) {
     return item;
 }
 
-// AVURLAsset initWithURL:
 static id (*o_Asset_initWithURL)(id,SEL,NSURL*);
 static id sw_Asset_initWithURL(id self, SEL _cmd, NSURL *url) {
     id asset = o_Asset_initWithURL? o_Asset_initWithURL(self,_cmd,url):nil;
@@ -233,7 +248,6 @@ static id sw_Asset_initWithURL(id self, SEL _cmd, NSURL *url) {
     return asset;
 }
 
-// AVURLAsset initWithURL:options:
 static id (*o_Asset_initWithURL_opts)(id,SEL,NSURL*,NSDictionary*);
 static id sw_Asset_initWithURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary *opts) {
     id asset = o_Asset_initWithURL_opts? o_Asset_initWithURL_opts(self,_cmd,url,opts):nil;
@@ -241,12 +255,10 @@ static id sw_Asset_initWithURL_opts(id self, SEL _cmd, NSURL *url, NSDictionary 
     return asset;
 }
 
-// AVPlayer 替换当前 item 时也观察
 static void (*o_Player_replace)(id,SEL,AVPlayerItem*);
 static void sw_Player_replace(id self, SEL _cmd, AVPlayerItem *item) {
     if (item) {
         @try {
-            // 若能拿到 URL（常见是 AVURLAsset）
             if ([item.asset isKindOfClass:AVURLAsset.class]) {
                 NSURL *u = ((AVURLAsset *)item.asset).URL;
                 if (u) AS_Report(u.absoluteString);
@@ -285,7 +297,7 @@ static void Install_AV(void) {
     } @catch(...) { NSLog(@"[AS] AV hooks failed."); }
 }
 
-#pragma mark - WK (保留轻量注入)
+#pragma mark - WKWebView (light js)
 
 @interface _AS_WKHandler : NSObject <WKScriptMessageHandler>
 @end
@@ -316,7 +328,9 @@ static void AddWKScripts(WKWebViewConfiguration *cfg) {
       "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{R(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
     "}catch(e){}})();";
 
-    WKUserScript *sc = [[WKUserScript alloc] initWithSource:js injectionTime:WKUserScriptInjectionTimeAtDocumentStart forMainFrameOnly:NO];
+    WKUserScript *sc = [[WKUserScript alloc] initWithSource:js
+                                              injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                           forMainFrameOnly:NO];
     @try { [cfg.userContentController addUserScript:sc]; } @catch (...) {}
 }
 
@@ -344,6 +358,75 @@ static void Install_WK(void) {
     } @catch(...) { NSLog(@"[AS] WK hooks failed."); }
 }
 
+#pragma mark - Generic URL setters / play entries
+
+static SEL AS_URLLikeSelectors[] = {
+    @selector(setUrl:), @selector(setURL:),
+    @selector(setPlayUrl:), @selector(setPlayURL:),
+    @selector(prepareWithURL:), @selector(playWithURL:),
+    @selector(replaceCurrentItemWithURL:),
+    NSSelectorFromString(@"setSourceUrl:"), NSSelectorFromString(@"setSourceURL:"),
+    NSSelectorFromString(@"setPlayerURL:"), NSSelectorFromString(@"startPlay:")
+};
+
+typedef void (*msgSend_id_id)(id, SEL, id);
+
+static void AS_tryReportArg(id arg) {
+    @try {
+        NSString *s = nil;
+        if ([arg isKindOfClass:NSString.class]) s = (NSString *)arg;
+        else if ([arg isKindOfClass:NSURL.class]) s = [(NSURL *)arg absoluteString];
+        if (s.length && !AS_isBlack(s) && (AS_isKuniNet(s) || AS_hasAuthKey(s) || AS_likeStream(s))) {
+            AS_Report(s);
+        }
+    } @catch(...) {}
+}
+
+static void AS_sw_generic_setter(id self, SEL _cmd, id arg) {
+    AS_tryReportArg(arg);
+    // 原 IMP 存在 class 关联上，用 selector 作 key 取回
+    IMP orig = (__bridge IMP)objc_getAssociatedObject([self class], _cmd);
+    if (orig) ((msgSend_id_id)orig)(self, _cmd, arg);
+}
+
+static void AS_trySwizzleSelector(Class cls, SEL sel) {
+    if (!cls || !sel) return;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+
+    // 保存原实现到 Class 关联，key 用 selector
+    IMP orig = method_getImplementation(m);
+    objc_setAssociatedObject((id)cls, sel, (__bridge id)orig, OBJC_ASSOCIATION_ASSIGN);
+
+    method_setImplementation(m, (IMP)AS_sw_generic_setter);
+    NSLog(@"[AS] generic hook: %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel));
+}
+
+static void AS_Install_Generic_URL_Hooks(void) {
+    @try {
+        NSArray<NSString *> *candidates = @[
+            // 阿里/常见播放器类名（尽量覆盖）
+            @"AliPlayer", @"AliLivePlayer", @"ApsaraPlayer", @"AVPUrlSource",
+            @"AlivcLivePlayer", @"AlivcLongVideo", @"AUIPlayer",
+            // 兜底：常见命名
+            @"Player", @"LivePlayer", @"URLSource", @"VideoPlayer"
+        ];
+
+        for (NSString *name in candidates) {
+            Class cls = NSClassFromString(name);
+            if (!cls) continue;
+            for (NSUInteger i=0; i<sizeof(AS_URLLikeSelectors)/sizeof(SEL); i++) {
+                SEL sel = AS_URLLikeSelectors[i];
+                if ([cls instancesRespondToSelector:sel]) {
+                    AS_trySwizzleSelector(cls, sel);
+                }
+            }
+        }
+    } @catch (...) {
+        NSLog(@"[AS] generic url hooks failed.");
+    }
+}
+
 #pragma mark - Banner & bootstrap
 
 static void ShowInjectedOnce(void) {
@@ -351,10 +434,13 @@ static void ShowInjectedOnce(void) {
     dispatch_once(&once, ^{
         dispatch_async(dispatch_get_main_queue(), ^{
             if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
-                AS_AlertOK(@"AliSniffer", @"注入成功（主抓直播源，含 AVURLAsset/AVPlayer 路径）");
+                AS_AlertOK(@"AliSniffer", @"注入成功（主抓直播源，含 AVURLAsset/AVPlayer/通用URL入口）");
             } else {
-                [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n){
-                    AS_AlertOK(@"AliSniffer", @"注入成功（主抓直播源，含 AVURLAsset/AVPlayer 路径）");
+                [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                                  object:nil
+                                                                   queue:NSOperationQueue.mainQueue
+                                                              usingBlock:^(__unused NSNotification *n){
+                    AS_AlertOK(@"AliSniffer", @"注入成功（主抓直播源，含 AVURLAsset/AVPlayer/通用URL入口）");
                 }];
             }
         });
@@ -367,6 +453,7 @@ static void BootAll(void) {
         Install_Session();
         Install_AV();
         Install_WK();
+        AS_Install_Generic_URL_Hooks(); // 新增：通用 URL/播放入口
         NSLog(@"[AS] bootstrap done.");
         ShowInjectedOnce();
     } @catch(...) {
