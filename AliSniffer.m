@@ -1,6 +1,10 @@
 //
-// AliSniffer.m  (focus live; wide hooks: Session/AV/AVURLAsset/AVPlayer/WK + generic URL setters)
-// iOS 11+ / arm64 / -fobjc-arc
+//  AliSniffer.m
+//  iOS 11+ / arm64 / -fobjc-arc / -ObjC
+//
+//  功能：主抓直播源（auth_key 优先 + 常见流特征），静音阿里日志与业务接口；
+//       覆盖 NSURLSession、AVPlayerItem/AVURLAsset/AVPlayer、WKWebView 注入、
+//       以及通用 URL setter/播放入口（setUrl:/setURL:/playWithURL:/prepareWithURL: 等）。
 //
 
 #import <Foundation/Foundation.h>
@@ -86,18 +90,16 @@ static BOOL AS_isBlack(NSString *s) {
     NSString *host = u.host.lowercaseString ?: @"";
     NSString *path = u.path.lowercaseString ?: @"";
 
-    // 1) 阿里日志上报
+    // 1) 阿里日志
     if ([host hasSuffix:@"log.aliyuncs.com"]) return YES;
     if ([lower containsString:@"/logstores/"]) return YES;
 
-    // 2) kuniunet 的非流业务接口
-    // liveContentList / playNumCount
+    // 2) kuniunet 非流业务接口（静音）
     if ([host containsString:@"app.kuniunet.com"] &&
         [path containsString:@"/mag/"] &&
         ([lower containsString:@"livecontentlist"] || [lower containsString:@"playnumcount"])) {
         return YES;
     }
-    // lychat 全部静音
     if ([host containsString:@"app.kuniunet.com"] &&
         [path containsString:@"/lychat/"]) {
         return YES;
@@ -127,7 +129,6 @@ static BOOL AS_likeStream(NSString *s) {
 static void AS_Report(NSString *url) {
     if (url.length==0) return;
     if (AS_isBlack(url)) return;
-    // 白名单域名优先；否则需命中 auth_key 或流特征
     if (!(AS_isKuniNet(url) || AS_hasAuthKey(url) || AS_likeStream(url))) return;
 
     NSLog(@"[AS] stream candidate: %@", url);
@@ -139,7 +140,7 @@ static void AS_Report(NSString *url) {
     AS_AlertCopy(url);
 }
 
-#pragma mark - NSURLSession
+#pragma mark - NSURLSession hooks
 
 static id (*o_NSURLSession_dataTaskWithRequest)(id,SEL,NSURLRequest*);
 static id sw_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *req) {
@@ -147,9 +148,7 @@ static id sw_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *r
     if (task && req) {
         @try {
             NSString *u = req.URL.absoluteString ?: @"";
-            if (!AS_isBlack(u) && (AS_isKuniNet(u) || AS_hasAuthKey(u))) {
-                AS_Report(u);
-            }
+            if (!AS_isBlack(u) && (AS_isKuniNet(u) || AS_hasAuthKey(u))) AS_Report(u);
             objc_setAssociatedObject(task, "as_req", req, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } @catch (...) {}
     }
@@ -162,9 +161,7 @@ static id sw_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *url) {
     if (task && url) {
         @try {
             NSString *u = url.absoluteString ?: @"";
-            if (!AS_isBlack(u) && (AS_isKuniNet(u) || AS_hasAuthKey(u))) {
-                AS_Report(u);
-            }
+            if (!AS_isBlack(u) && (AS_isKuniNet(u) || AS_hasAuthKey(u))) AS_Report(u);
             objc_setAssociatedObject(task, "as_req", [NSURLRequest requestWithURL:url], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } @catch (...) {}
     }
@@ -180,9 +177,7 @@ static void sw_NSURLSessionTask_resume(id self, SEL _cmd) {
         }
         NSString *u = r.URL.absoluteString ?: @"";
         if (u.length && !AS_isBlack(u)) {
-            if (AS_isKuniNet(u) || AS_hasAuthKey(u) || AS_likeStream(u)) {
-                AS_Report(u);
-            }
+            if (AS_isKuniNet(u) || AS_hasAuthKey(u) || AS_likeStream(u)) AS_Report(u);
         }
     } @catch (...) {}
     if (o_NSURLSessionTask_resume) o_NSURLSessionTask_resume(self,_cmd);
@@ -201,7 +196,7 @@ static void Install_Session(void) {
         Class S = NSClassFromString(@"NSURLSession");
         if (S) {
             swizzle(S, @selector(dataTaskWithRequest:), (IMP)sw_NSURLSession_dataTaskWithRequest, (IMP*)&o_NSURLSession_dataTaskWithRequest);
-            swizzle(S, @selector(dataTaskWithURL:), (IMP)sw_NSURLSession_dataTaskWithURL, (IMP*)&o_NSURLSession_dataTaskWithURL);
+            swizzle(S, @selector(dataTaskWithURL:),     (IMP)sw_NSURLSession_dataTaskWithURL,     (IMP*)&o_NSURLSession_dataTaskWithURL);
         }
         Class T = NSClassFromString(@"NSURLSessionTask");
         if (T) swizzle(T, @selector(resume), (IMP)sw_NSURLSessionTask_resume, (IMP*)&o_NSURLSessionTask_resume);
@@ -209,7 +204,7 @@ static void Install_Session(void) {
     } @catch(...) { NSLog(@"[AS] NSURLSession hooks failed."); }
 }
 
-#pragma mark - AV path (AVPlayerItem/AVURLAsset/AVPlayer)
+#pragma mark - AV path: AVPlayerItem/AVURLAsset/AVPlayer
 
 static void ObserveItem(AVPlayerItem *item) {
     if (!item) return;
@@ -358,18 +353,31 @@ static void Install_WK(void) {
     } @catch(...) { NSLog(@"[AS] WK hooks failed."); }
 }
 
-#pragma mark - Generic URL setters / play entries
-
-static SEL AS_URLLikeSelectors[] = {
-    @selector(setUrl:), @selector(setURL:),
-    @selector(setPlayUrl:), @selector(setPlayURL:),
-    @selector(prepareWithURL:), @selector(playWithURL:),
-    @selector(replaceCurrentItemWithURL:),
-    NSSelectorFromString(@"setSourceUrl:"), NSSelectorFromString(@"setSourceURL:"),
-    NSSelectorFromString(@"setPlayerURL:"), NSSelectorFromString(@"startPlay:")
-};
+#pragma mark - Generic URL setters / play entries (fixed)
 
 typedef void (*msgSend_id_id)(id, SEL, id);
+
+// 用 class 关联一个 { selectorName : NSValue(pointer=IMP) } 的字典
+static char kAS_OrigIMPMapKey;
+
+static void AS_StoreOrigIMP(Class cls, SEL sel, IMP imp) {
+    if (!cls || !sel || !imp) return;
+    @autoreleasepool {
+        NSMutableDictionary *map = objc_getAssociatedObject(cls, &kAS_OrigIMPMapKey);
+        if (!map) {
+            map = [NSMutableDictionary dictionary];
+            objc_setAssociatedObject(cls, &kAS_OrigIMPMapKey, map, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        map[NSStringFromSelector(sel)] = [NSValue valueWithPointer:(void *)imp];
+    }
+}
+
+static IMP AS_LoadOrigIMP(Class cls, SEL sel) {
+    if (!cls || !sel) return NULL;
+    NSMutableDictionary *map = objc_getAssociatedObject(cls, &kAS_OrigIMPMapKey);
+    NSValue *v = map[NSStringFromSelector(sel)];
+    return v ? (IMP)[v pointerValue] : NULL;
+}
 
 static void AS_tryReportArg(id arg) {
     @try {
@@ -382,10 +390,10 @@ static void AS_tryReportArg(id arg) {
     } @catch(...) {}
 }
 
+// 通用 wrapper：先上报，再回调原始 IMP
 static void AS_sw_generic_setter(id self, SEL _cmd, id arg) {
     AS_tryReportArg(arg);
-    // 原 IMP 存在 class 关联上，用 selector 作 key 取回
-    IMP orig = (__bridge IMP)objc_getAssociatedObject([self class], _cmd);
+    IMP orig = AS_LoadOrigIMP([self class], _cmd);
     if (orig) ((msgSend_id_id)orig)(self, _cmd, arg);
 }
 
@@ -393,17 +401,24 @@ static void AS_trySwizzleSelector(Class cls, SEL sel) {
     if (!cls || !sel) return;
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return;
-
-    // 保存原实现到 Class 关联，key 用 selector
     IMP orig = method_getImplementation(m);
-    objc_setAssociatedObject((id)cls, sel, (__bridge id)orig, OBJC_ASSOCIATION_ASSIGN);
-
+    AS_StoreOrigIMP(cls, sel, orig);
     method_setImplementation(m, (IMP)AS_sw_generic_setter);
     NSLog(@"[AS] generic hook: %@ %@", NSStringFromClass(cls), NSStringFromSelector(sel));
 }
 
 static void AS_Install_Generic_URL_Hooks(void) {
     @try {
+        // 运行期构造 selector 列表（避免全局初始化报错）
+        NSArray<NSString *> *selNames = @[
+            @"setUrl:", @"setURL:",
+            @"setPlayUrl:", @"setPlayURL:",
+            @"prepareWithURL:", @"playWithURL:",
+            @"replaceCurrentItemWithURL:",
+            @"setSourceUrl:", @"setSourceURL:",
+            @"setPlayerURL:", @"startPlay:"
+        ];
+
         NSArray<NSString *> *candidates = @[
             // 阿里/常见播放器类名（尽量覆盖）
             @"AliPlayer", @"AliLivePlayer", @"ApsaraPlayer", @"AVPUrlSource",
@@ -415,8 +430,8 @@ static void AS_Install_Generic_URL_Hooks(void) {
         for (NSString *name in candidates) {
             Class cls = NSClassFromString(name);
             if (!cls) continue;
-            for (NSUInteger i=0; i<sizeof(AS_URLLikeSelectors)/sizeof(SEL); i++) {
-                SEL sel = AS_URLLikeSelectors[i];
+            for (NSString *sn in selNames) {
+                SEL sel = NSSelectorFromString(sn);
                 if ([cls instancesRespondToSelector:sel]) {
                     AS_trySwizzleSelector(cls, sel);
                 }
@@ -453,7 +468,7 @@ static void BootAll(void) {
         Install_Session();
         Install_AV();
         Install_WK();
-        AS_Install_Generic_URL_Hooks(); // 新增：通用 URL/播放入口
+        AS_Install_Generic_URL_Hooks();
         NSLog(@"[AS] bootstrap done.");
         ShowInjectedOnce();
     } @catch(...) {
