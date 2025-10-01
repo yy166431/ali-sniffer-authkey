@@ -1,9 +1,8 @@
 //
-// AliSniffer.m  (minimal, auth_key-aware)
+// AliSniffer.m  (minimal, auth_key-aware, aliyun-log-aware)
 // 目标：最小可注入 dylib，尽快抓到带 auth_key 的直播源（优先匹配 auth_key）
 // 依赖：Foundation / UIKit / WebKit / AVFoundation
 // 编译：-fobjc-arc，arm64，iOS 11+，动态库
-// 说明：当 URL 包含 "auth_key"（不区分大小写）时优先上报；否则仍会匹配常见流后缀（m3u8/ts/mp4/flv等）
 //
 
 #import <Foundation/Foundation.h>
@@ -36,12 +35,36 @@ static BOOL AS_urlLooksLikeStream(NSString *url) {
     return (m != nil);
 }
 
+// 新增：检测阿里上报 / Alivc 相关请求（host / headers / url）
+static BOOL AS_urlLooksLikeAliyunLogOrAlivc(NSURLRequest *req) {
+    if (!req) return NO;
+    NSURL *u = req.URL;
+    if (u) {
+        NSString *host = u.host.lowercaseString ?: @"";
+        if ([host containsString:@"aliyuncs.com"] || [host containsString:@"alivc"] || [host containsString:@"alicdn"] || [host containsString:@"aliyun"]) {
+            return YES;
+        }
+        NSString *s = u.absoluteString.lowercaseString ?: @"";
+        if ([s containsString:@"alivc"] || [s containsString:@"aliplayer"] || [s containsString:@"alivc-aio"]) return YES;
+    }
+    NSDictionary *h = req.allHTTPHeaderFields;
+    if (h) {
+        for (NSString *k in h.allKeys) {
+            NSString *lk = k.lowercaseString ?: @"";
+            NSString *v = (h[k] ?: @"");
+            if ([lk containsString:@"x-acs"] || [lk containsString:@"x-log"] ) return YES;
+            if ([lk isEqualToString:@"authorization"] && [v.uppercaseString containsString:@"LOG"]) return YES;
+        }
+    }
+    return NO;
+}
+
 #pragma mark - 简单上报（含弹窗复制）
 
 static void AS_ReportURLAndAlert(NSString *url) {
     if (!url.length) return;
-    // Only report if it contains auth_key OR looks like a stream
-    if (!AS_urlContainsAuthKey(url) && !AS_urlLooksLikeStream(url)) return;
+    // Only report if it contains auth_key OR looks like a stream OR aliyun-like
+    if (!AS_urlContainsAuthKey(url) && !AS_urlLooksLikeStream(url) && !([url.lowercaseString containsString:@"aliyun"] || [url.lowercaseString containsString:@"alivc"])) return;
     NSLog(@"[AS-Min] Found URL: %@", url);
     @try {
         [[NSNotificationCenter defaultCenter] postNotificationName:@"AliSnifferFoundURL"
@@ -80,13 +103,19 @@ static void AS_ReportURLAndAlert(NSString *url) {
     });
 }
 
-#pragma mark - NSURLSession / NSURLSessionTask
+#pragma mark - NSURLSession / NSURLSessionTask (hooks)
 
 static id (*as_orig_NSURLSession_dataTaskWithRequest)(id, SEL, NSURLRequest *);
 static id as_swz_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
     id task = as_orig_NSURLSession_dataTaskWithRequest ? as_orig_NSURLSession_dataTaskWithRequest(self, _cmd, request) : nil;
-    if (task && request.URL) {
-        @try { objc_setAssociatedObject(task, "as_task_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC); } @catch(...) {}
+    if (task && request) {
+        @try {
+            // 优先上报包含 auth_key 或 阿里/Alivc 相关的请求
+            if (AS_urlContainsAuthKey(request.URL.absoluteString) || AS_urlLooksLikeAliyunLogOrAlivc(request)) {
+                AS_ReportURLAndAlert(request.URL.absoluteString ?: (request.HTTPBody ? [[NSString alloc] initWithData:request.HTTPBody encoding:NSUTF8StringEncoding] : @"(req-without-url)"));
+            }
+            objc_setAssociatedObject(task, "as_task_req", request, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } @catch(...) {}
     }
     return task;
 }
@@ -97,6 +126,10 @@ static id as_swz_NSURLSession_dataTaskWithURL(id self, SEL _cmd, NSURL *url) {
     if (task && url) {
         @try {
             NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url];
+            // 也做一次快速上报（url 中包含 auth_key 或可能是 aliyun）
+            if (AS_urlContainsAuthKey(url.absoluteString) || [url.absoluteString.lowercaseString containsString:@"aliyun"] || [url.absoluteString.lowercaseString containsString:@"alivc"]) {
+                AS_ReportURLAndAlert(url.absoluteString);
+            }
             objc_setAssociatedObject(task, "as_task_req", r, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } @catch(...) {}
     }
@@ -117,8 +150,11 @@ static void as_swz_NSURLSessionTask_resume(id self, SEL _cmd) {
                 AS_ReportURLAndAlert(u);
             } else if (AS_urlLooksLikeStream(u)) {
                 AS_ReportURLAndAlert(u);
+            } else if (AS_urlLooksLikeAliyunLogOrAlivc(r)) {
+                // 上报阿里/Alivc 类型的请求（即使不是直接流）
+                AS_ReportURLAndAlert(u);
             } else {
-                // Not a stream and no auth_key => ignore
+                // 不是流、没有auth_key => 不强制上报
             }
             NSNumber *done = objc_getAssociatedObject(self, "as_task_reported");
             if (!done || !done.boolValue) {
@@ -133,7 +169,7 @@ static void as_swizzle(Class c, SEL sel, IMP newImp, IMP *origOut) {
     if (!c) return;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
-    if (origOut) *origOut = method_getImplementation(m);
+    if (origOut) *origOut = (void *)method_getImplementation(m);
     method_setImplementation(m, newImp);
 }
 
@@ -174,8 +210,8 @@ static void as_observe_AVItem_once(AVPlayerItem *item) {
                     uri = [ev valueForKey:@"URI"];
                 }
                 if (uri.length) {
-                    // Only report if auth_key present or looks like stream
-                    if (AS_urlContainsAuthKey(uri) || AS_urlLooksLikeStream(uri)) {
+                    // Only report if auth_key present or looks like stream or aliyun
+                    if (AS_urlContainsAuthKey(uri) || AS_urlLooksLikeStream(uri) || [uri.lowercaseString containsString:@"aliyun"] || [uri.lowercaseString containsString:@"alivc"]) {
                         AS_ReportURLAndAlert(uri);
                     }
                 }
@@ -219,8 +255,8 @@ static void as_install_av_hooks(void) {
     if ([m.body isKindOfClass:NSString.class]) s = (NSString *)m.body;
     else if ([m.body isKindOfClass:NSURL.class]) s = [(NSURL *)m.body absoluteString];
     if (s.length) {
-        // prefer auth_key hits
-        if (AS_urlContainsAuthKey(s) || AS_urlLooksLikeStream(s)) AS_ReportURLAndAlert(s);
+        // prefer auth_key hits or aliyun-like hits
+        if (AS_urlContainsAuthKey(s) || AS_urlLooksLikeStream(s) || [s.lowercaseString containsString:@"aliyun"] || [s.lowercaseString containsString:@"alivc"]) AS_ReportURLAndAlert(s);
     }
 }
 @end
@@ -236,9 +272,8 @@ static void as_add_wk_scripts(WKWebViewConfiguration *cfg) {
 
     NSString *js =
     @"(function(){try{"
-     "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)"
-     "window.webkit.messageHandlers._S.postMessage('AS_JS_OK');"
-     "function R(u){try{if(u&&/(auth_key=|m3u8|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv)/i.test(u))window.webkit.messageHandlers._S.postMessage(u);}catch(e){}}"
+     "if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers._S)window.webkit.messageHandlers._S.postMessage('AS_JS_OK');"
+     "function R(u){try{if(u&&/(auth_key=|m3u8|\\.mpd(\\?|$)|\\.m4s(\\?|$)|\\.ts(\\?|$)|\\.mp4(\\?|$)|\\.flv(\\?|$)|^rtmps?:\\/\\/|^wss?:\\/\\/.*\\.flv|alivc|aliyuncs)/i.test(u))window.webkit.messageHandlers._S.postMessage(u);}catch(e){}}"
      "if(window.fetch){var _f=window.fetch;window.fetch=function(){var u=arguments[0];try{if(typeof u==='string')R(u);}catch(e){}return _f.apply(this,arguments).then(function(r){try{if(r&&r.url)R(r.url);}catch(e){}return r;});};}"
      "if(window.XMLHttpRequest){var X=window.XMLHttpRequest;var o=X.prototype.open;X.prototype.open=function(m,u){try{R(u);}catch(e){}return o.apply(this,arguments);};}"
      "if(window.HTMLMediaElement){var d=Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype,'src');if(d&&d.set){Object.defineProperty(HTMLMediaElement.prototype,'src',{set:function(v){try{R(v);}catch(e){}return d.set.call(this,v);},get:d.get});}}"
@@ -278,5 +313,20 @@ static void as_install_wk_hooks(void) {
         NSLog(@"[AS-Min] WK hooks installed.");
     } @catch (...) {
         NSLog(@"[AS-Min] WK hooks failed.");
+    }
+}
+
+#pragma mark - bootstrap
+
+// 汇总安装所有 hooks
+__attribute__((constructor))
+static void as_bootstrap_all(void) {
+    @try {
+        as_install_session_hooks();
+        as_install_av_hooks();
+        as_install_wk_hooks();
+        NSLog(@"[AS-Min] AliSniffer minimal bootstrap done.");
+    } @catch (...) {
+        NSLog(@"[AS-Min] AliSniffer bootstrap encountered an error.");
     }
 }
